@@ -1,0 +1,21 @@
+# Node
+node_modules
+dist
+build
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Env files
+.env
+
+# Uploads / embeddings
+uploads/
+face_embeddings.pkl
+
+# OS
+.DS_Store
+Thumbs.db
