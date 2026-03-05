@@ -55,4 +55,3 @@ wcwidth==0.6.0
 uvicorn
 fastapi
 python-multipart
-face-recognition
