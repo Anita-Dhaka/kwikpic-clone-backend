@@ -3,11 +3,14 @@ import numpy as np
 from pymongo import MongoClient
 from bson.binary import Binary
 from face_embedding import extract_all_embeddings
+import os
+from dotenv import load_dotenv
 
+load_dotenv()
 # -------------------------
 # MongoDB Atlas connection
 # -------------------------
-MONGO_URI = "mongodb+srv://<db>:<password>@cluster0.qn2xo0j.mongodb.net/Cluster0?retryWrites=true&w=majority"
+MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = "face_db"
 COLLECTION_NAME = "faces_collection"
 
