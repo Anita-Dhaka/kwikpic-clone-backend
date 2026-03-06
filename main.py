@@ -6,7 +6,7 @@ from face_recognise import insert_embedding, search_embedding, clear_collection
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import os
-import uuid
+import shutil
 
 origins = ["http://localhost:5173", "http://127.0.0.1:5173", "https://kwikpic-clone-frontend.vercel.app",]
 
@@ -39,7 +39,7 @@ async def upload_album(files: list[UploadFile] = File(...), ids: list[str] = For
         file_path = os.path.join(UPLOAD_FOLDER, f"{file_id}_{file.filename}")
 
         with open(file_path, "wb") as f:
-            f.write(await file.read())
+            shutil.copyfileobj(file.file, f)
 
         # Insert embedding with file_id
         insert_embedding(file_path, file_id)
