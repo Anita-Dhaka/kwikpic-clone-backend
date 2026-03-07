@@ -51,6 +51,7 @@ def get_embedding(image_path: str):
         raise ValueError(f"Image not found: {image_path}")
 
     faces = face_app.get(img)
+    print("Faces detected:", len(faces))
 
     if not faces:
         raise ValueError(f"No face detected in {image_path}")

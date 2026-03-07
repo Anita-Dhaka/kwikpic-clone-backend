@@ -4,7 +4,8 @@ python-multipart
 numpy
 opencv-python-headless
 pillow
-pymongo
+# pymongo
+pymilvus
 python-dotenv
 insightface
 onnxruntime

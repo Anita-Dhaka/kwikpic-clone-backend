@@ -98,7 +98,7 @@ async def match_selfie(file: UploadFile = File(...)):
 
         results = search_embedding(embedding, top_k=150)
 
-        SIMILARITY_THRESHOLD = 0.6
+        SIMILARITY_THRESHOLD = 0.5
 
         filtered = [
             r for r in results if r["score"] >= SIMILARITY_THRESHOLD
