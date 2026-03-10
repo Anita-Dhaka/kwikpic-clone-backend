@@ -7,5 +7,5 @@ opencv-python-headless
 pymongo
 python-dotenv
 insightface
-# onnxruntime
+onnxruntime
 cloudinary>=1.36.0
