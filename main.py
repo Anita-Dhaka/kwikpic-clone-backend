@@ -1,21 +1,18 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import shutil
 import uuid
+import tempfile
 
 from face_embedding import get_selfie_embedding
-from face_recognise import insert_embedding, search_embedding, clear_collection
+from face_recognise import insert_embedding, search_embedding, upload_to_cloudinary
 
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "https://kwikpic-clone-frontend.vercel.app",
 ]
-
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app = FastAPI(title="Face Recognition API")
 
@@ -27,7 +24,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+# Max images allowed per album upload
+MAX_IMAGES_PER_ALBUM = 200
 
 
 # ------------------------
@@ -36,45 +34,71 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 @app.post("/upload_album")
 async def upload_album(
-    background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
-    ids: list[str] = Form(...)
 ):
+    """
+    Accepts multiple image files. For each image:
+      1. Generates a unique album_id (shared across all images in this upload).
+      2. Generates a unique image_id per image.
+      3. Saves image to a temp file.
+      4. Uploads image to Cloudinary under albums/{album_id}/.
+      5. Extracts face embeddings and stores one MongoDB doc per face.
+      6. Cleans up the local temp file.
 
-    if len(files) != len(ids):
+    Returns the album_id and per-image metadata.
+    """
+    if len(files) > MAX_IMAGES_PER_ALBUM:
         raise HTTPException(
             status_code=400,
-            detail="files and ids count mismatch"
+            detail=f"You can upload a maximum of {MAX_IMAGES_PER_ALBUM} images per album",
         )
 
-    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-    clear_collection()
-    for f in os.listdir(UPLOAD_FOLDER):
-        os.remove(os.path.join(UPLOAD_FOLDER, f))
+    # Single album_id shared across all images in this batch
+    album_id = str(uuid.uuid4())
 
     saved_data = []
 
-    for file, file_id in zip(files, ids):
+    for file in files:
+        image_id = str(uuid.uuid4())
+        image_name = file.filename or f"{image_id}.jpg"
 
-        unique_name = f"{file_id}_{uuid.uuid4()}_{file.filename}"
-        file_path = os.path.join(UPLOAD_FOLDER, unique_name)
+        # Write to a named temp file so InsightFace can read it via cv2
+        suffix = os.path.splitext(image_name)[-1] or ".jpg"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            tmp_path = tmp.name
 
-        with open(file_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+        try:
+            # 1. Upload to Cloudinary → get public URL
+            image_url = upload_to_cloudinary(tmp_path, album_id, image_name)
+            print(f"Uploaded to Cloudinary: {image_url}")
 
-        # Background embedding generation
-        # background_tasks.add_task(insert_embedding, file_path, file_id)
-        insert_embedding(file_path, file_id)
-        print("Embedding stored for:", file_path)
+            # 2. Extract embeddings and store in MongoDB
+            insert_embedding(
+                image_path=tmp_path,
+                image_id=image_id,
+                album_id=album_id,
+                image_name=image_name,
+                image_url=image_url,
+            )
+            print(f"Embedding stored for: {image_name}")
 
+            saved_data.append({
+                "image_id": image_id,
+                "image_name": image_name,
+                "image_url": image_url,
+            })
 
-        saved_data.append({
-            "id": file_id,
-            "image_path": file_path
-        })
+        finally:
+            # Always clean up the local temp file
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
-    return {"files": saved_data}
+    return {
+        "album_id": album_id,
+        "uploaded": len(saved_data),
+        "files": saved_data,
+    }
 
 
 # ------------------------
@@ -82,40 +106,57 @@ async def upload_album(
 # ------------------------
 
 @app.post("/match_selfie")
-async def match_selfie(file: UploadFile = File(...)):
+async def match_selfie(
+    file: UploadFile = File(...),
+    album_id: str = Form(...),
+):
+    """
+    Accepts a selfie and an album_id.
+    Generates an embedding from the selfie and performs a vector search
+    filtered to the provided album_id.
 
+    Returns deduplicated image matches with Cloudinary URLs.
+    """
     if not file:
         raise HTTPException(status_code=400, detail="No selfie uploaded")
 
-    unique_name = f"selfie_{uuid.uuid4()}_{file.filename}"
-    file_path = os.path.join(UPLOAD_FOLDER, unique_name)
-
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    suffix = os.path.splitext(file.filename or "selfie.jpg")[-1] or ".jpg"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
 
     try:
-        embedding = get_selfie_embedding(file_path)
+        embedding = get_selfie_embedding(tmp_path)
 
-        results = search_embedding(embedding, top_k=150)
+        # Vector search filtered by album_id
+        results = search_embedding(embedding, album_id=album_id, top_k=150)
 
         SIMILARITY_THRESHOLD = 0.6
 
-        filtered = [
-            r for r in results if r["score"] >= SIMILARITY_THRESHOLD
-        ]
+        filtered = [r for r in results if r["score"] >= SIMILARITY_THRESHOLD]
 
-        unique_images = list(
-            set([r["image_path"] for r in filtered])
-        )
+        # Deduplicate by image_id — one result per unique image
+        seen_image_ids = set()
+        unique_matches = []
+
+        for r in filtered:
+            if r["image_id"] not in seen_image_ids:
+                seen_image_ids.add(r["image_id"])
+                unique_matches.append({
+                    "album_id": r["album_id"],
+                    "image_name": r["image_name"],
+                    "image_url": r["image_url"],
+                    "score": r["score"],
+                })
 
         for r in results:
-            print(r["image_path"], r["score"])
+            print(r["image_name"], r["score"])
 
-        return {"matches": unique_images}
+        return {"matches": unique_matches}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)

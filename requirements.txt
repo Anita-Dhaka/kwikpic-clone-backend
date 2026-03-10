@@ -3,8 +3,9 @@ uvicorn
 python-multipart
 numpy
 opencv-python-headless
-pillow
+# pillow
 pymongo
 python-dotenv
 insightface
-onnxruntime
+# onnxruntime
+cloudinary>=1.36.0
