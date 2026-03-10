@@ -1,22 +1,18 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import os
-import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from face_embedding import get_selfie_embedding
-from face_recognise import insert_embedding, search_embedding, clear_collection
+from face_recognise import insert_embedding, search_embedding
+from s3_helper import upload_image_to_s3, upload_bytes_to_s3
 
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "https://kwikpic-clone-frontend.vercel.app",
 ]
-
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app = FastAPI(title="Face Recognition API")
 
@@ -27,8 +23,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # ---------------------------------------------------------------
 # Thread pool for parallel embedding generation.
@@ -42,52 +36,76 @@ _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 # ---------------------------------------------------------------
 # Upload album  –  parallel embedding generation
+# Images go to S3, no local storage, no collection wipe
 # ---------------------------------------------------------------
 
 @app.post("/upload_album")
 async def upload_album(
     files: list[UploadFile] = File(...),
-    ids: list[str] = Form(...),
 ):
-    if len(files) != len(ids):
-        raise HTTPException(
-            status_code=400,
-            detail="files and ids count mismatch",
+    """
+    Accept a list of image files, assign a new album_id, upload each
+    image to S3, then generate and store face embeddings in MongoDB.
+
+    Returns the generated album_id so the client can use it later for
+    selfie matching.
+    """
+    album_id = str(uuid.uuid4())
+
+    # ── 1. Read file bytes and prepare metadata ──────────────────────
+    #    We read everything into memory here (async-safe) before
+    #    handing work off to threads.
+    file_payloads = []
+    for file in files:
+        image_bytes = await file.read()
+        await file.close()
+        image_id = str(uuid.uuid4())
+        original_name = file.filename or f"{image_id}.jpg"
+        s3_key = f"albums/{album_id}/{image_id}_{original_name}"
+        file_payloads.append({
+            "album_id": album_id,
+            "image_id": image_id,
+            "image_name": original_name,
+            "s3_key": s3_key,
+            "image_bytes": image_bytes,
+            "content_type": file.content_type or "image/jpeg",
+        })
+
+    # ── 2. Upload to S3 + generate embeddings in parallel ───────────
+    def process_image(payload: dict):
+        """Upload to S3, then insert face embeddings into MongoDB."""
+        upload_bytes_to_s3(
+            data=payload["image_bytes"],
+            s3_key=payload["s3_key"],
+            content_type=payload["content_type"],
+        )
+        insert_embedding(
+            image_bytes=payload["image_bytes"],
+            album_id=payload["album_id"],
+            image_id=payload["image_id"],
+            image_name=payload["image_name"],
+            s3_key=payload["s3_key"],
         )
 
-    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-    # Clear old data
-    clear_collection()
-    for f in os.listdir(UPLOAD_FOLDER):
-        os.remove(os.path.join(UPLOAD_FOLDER, f))
-
-    # ── 1. Save all files to disk first (fast I/O, sequential is fine) ──
-    saved_data = []
-    for file, file_id in zip(files, ids):
-        unique_name = f"{file_id}_{uuid.uuid4()}_{file.filename}"
-        file_path = os.path.join(UPLOAD_FOLDER, unique_name)
-        with open(file_path, "wb") as out:
-            shutil.copyfileobj(file.file, out)
-        saved_data.append({"id": file_id, "image_path": file_path})
-
-    # ── 2. Generate embeddings in parallel ──────────────────────────────
     futures = {
-        _executor.submit(insert_embedding, item["image_path"], item["id"]): item
-        for item in saved_data
+        _executor.submit(process_image, payload): payload
+        for payload in file_payloads
     }
 
     errors = []
     for future in as_completed(futures):
-        item = futures[future]
+        payload = futures[future]
         try:
             future.result()
-            print("Embedding stored:", item["image_path"])
+            print(f"Processed: {payload['s3_key']}")
         except Exception as exc:
-            errors.append({"path": item["image_path"], "error": str(exc)})
-            print(f"Embedding failed for {item['image_path']}: {exc}")
+            errors.append({"s3_key": payload["s3_key"], "error": str(exc)})
+            print(f"Failed {payload['s3_key']}: {exc}")
 
-    response: dict = {"files": saved_data}
+    response: dict = {
+        "message": "Album created successfully",
+        "album_id": album_id,
+    }
     if errors:
         response["warnings"] = errors
 
@@ -95,37 +113,52 @@ async def upload_album(
 
 
 # ---------------------------------------------------------------
-# Selfie matching  –  unchanged logic, benefits from faster embed
+# Selfie matching  –  filter by album_id, return S3 paths
 # ---------------------------------------------------------------
 
 @app.post("/match_selfie")
-async def match_selfie(file: UploadFile = File(...)):
+async def match_selfie(
+    file: UploadFile = File(...),
+    album_id: str = Form(...),
+):
+    """
+    Accept a selfie and an album_id.  Generate the selfie embedding,
+    run a MongoDB vector search scoped to that album, and return the
+    S3 paths of the matching images.
+    """
     if not file:
         raise HTTPException(status_code=400, detail="No selfie uploaded")
 
-    unique_name = f"selfie_{uuid.uuid4()}_{file.filename}"
-    file_path = os.path.join(UPLOAD_FOLDER, unique_name)
-
-    with open(file_path, "wb") as out:
-        shutil.copyfileobj(file.file, out)
+    image_bytes = await file.read()
+    await file.close()
 
     try:
-        embedding = get_selfie_embedding(file_path)
-        results = search_embedding(embedding, top_k=150)
+        embedding = get_selfie_embedding(image_bytes)
+        results = search_embedding(embedding, album_id=album_id, top_k=150)
+
+        print("\n---- VECTOR SEARCH RESULTS ----")
+        for r in results:
+            print(r["s3_key"], r["score"])
+        print("-------------------------------\n")
 
         SIMILARITY_THRESHOLD = 0.6
 
         filtered = [r for r in results if r["score"] >= SIMILARITY_THRESHOLD]
-        unique_images = list({r["image_path"] for r in filtered})
 
-        for r in results:
-            print(r["image_path"], r["score"])
+        # Deduplicate by s3_key (multiple faces can come from the same image)
+        seen = set()
+        unique_matches = []
+        for r in filtered:
+            if r["s3_key"] not in seen:
+                seen.add(r["s3_key"])
+                unique_matches.append({
+                    "album_id": r["album_id"],
+                    "image_name": r["image_name"],
+                    "s3_path": r["s3_key"],
+                    "score": r["score"],
+                })
 
-        return {"matches": unique_images}
+        return {"matches": unique_matches}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)

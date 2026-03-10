@@ -8,3 +8,4 @@ pymongo
 python-dotenv
 insightface
 onnxruntime
+boto3
