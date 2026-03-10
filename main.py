@@ -12,6 +12,7 @@ origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "https://kwikpic-clone-frontend.vercel.app",
+    "https://kwikpic-clone-frontend-git-aws-added-anita-dhakas-projects.vercel.app",
 ]
 
 app = FastAPI(title="Face Recognition API")
